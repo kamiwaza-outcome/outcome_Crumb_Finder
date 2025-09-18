@@ -240,11 +240,6 @@ This system is a template that requires configuration for your specific company.
 - GitHub account (for automation)
 - Slack workspace (optional)
 
-### ⏱️ Time Estimate
-- **Initial Setup**: 2-3 hours
-- **API Key Acquisition**: 24-48 hours (SAM.gov)
-- **Configuration & Testing**: 1-2 hours
-- **Total Time to Production**: 2-3 days (including wait time for API keys)
 
 ### Step 1: Clone and Prepare Repository
 ```bash
@@ -297,13 +292,13 @@ cp examples/software_consulting_config.json company_config.json
 1. Register at [SAM.gov](https://sam.gov)
 2. Navigate to [Federal Service Desk](https://fsd.gov)
 3. Sign in and request "System Account"
-4. API key will be emailed within 24-48 hours
+4. Request API key
 
 #### OpenAI API Key
 1. Sign up at [OpenAI Platform](https://platform.openai.com)
 2. Navigate to API keys section
 3. Create new secret key
-4. **Important**: Ensure you have GPT-5 API access (may require waitlist)
+4. Ensure you have GPT-5 API access
 
 ### Step 4: Google Cloud Setup
 
@@ -648,11 +643,6 @@ AI_KEYWORDS = [
 - **Success Rate**: 99.9% with retry logic
 - **Deduplication Rate**: 95%+ accuracy
 
-### Resource Utilization
-- **GPT-5 TPM**: 2,000,000 tokens/minute
-- **GPT-5-mini TPM**: 4,000,000 tokens/minute
-- **Google API Calls**: Optimized batching
-- **Memory Usage**: ~2GB during peak processing
 
 ## 🚦 Monitoring & Alerts
 
@@ -701,35 +691,3 @@ Crumb_finder/
 └── config.py            # System configuration
 ```
 
-## 🤝 Contributing
-
-We welcome contributions! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
-## 📄 License
-
-This project is proprietary software. All rights reserved.
-
-## 🙏 Acknowledgments
-
-- **Built for**: [YOUR_COMPANY]
-- **Powered by**: OpenAI GPT-5 & GPT-5-mini
-- **Data source**: SAM.gov public API
-- **Infrastructure**: Google Cloud Platform
-
-## 📞 Support
-
-For issues or questions:
-- Open a GitHub issue
-- Check GitHub Actions logs
-- Review sheet maintenance logs
-- Contact the development team
-
----
-
-**Last Updated**: December 2025
-**Version**: 3.0.0
-**Status**: Production Ready 🚀
