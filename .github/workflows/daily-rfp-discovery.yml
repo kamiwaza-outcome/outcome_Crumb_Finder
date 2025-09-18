@@ -1,0 +1,128 @@
+name: Daily RFP Discovery
+
+on:
+  schedule:
+    # Run at 5:00 AM Eastern Time (10:00 UTC) on Tuesday-Saturday
+    # Note: GitHub Actions uses UTC time
+    # Saturday captures Friday's RFPs, Tue-Fri capture previous day
+    - cron: '0 10 * * 2-6'
+  
+  # Allow manual trigger with mode selection
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Discovery Mode'
+        required: true
+        default: 'overkill'  # OVERKILL is now default
+        type: choice
+        options:
+          - 'overkill'    # No filters, process ALL RFPs (2000+) - DEFAULT
+          - 'normal'      # Standard filters (200-500 RFPs) 
+          - 'test'        # Test mode (20 RFPs)
+      max_rfps:
+        description: 'Max RFPs to process (default 5000 for overkill)'
+        required: false
+        default: '5000'
+      days_back:
+        description: 'Days to look back (default 1, use 3 for weekends)'
+        required: false
+        default: '1'
+
+jobs:
+  discover-rfps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # Allow up to 6 hours for processing
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Decode Google credentials
+      env:
+        GOOGLE_CREDENTIALS_BASE64: ${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}
+      run: |
+        echo "$GOOGLE_CREDENTIALS_BASE64" | base64 -d > /tmp/google-credentials.json
+        echo "Google credentials decoded successfully"
+    
+    - name: Run RFP Discovery
+      env:
+        SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GOOGLE_SHEETS_CREDS_PATH: /tmp/google-credentials.json
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        SPAM_SPREADSHEET_ID: ${{ secrets.SPAM_SPREADSHEET_ID }}
+        MAYBE_SPREADSHEET_ID: ${{ secrets.MAYBE_SPREADSHEET_ID }}
+        GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        DISCOVERY_MODE: ${{ github.event.inputs.mode || 'overkill' }}
+        MAX_RFPS: ${{ github.event.inputs.max_rfps || '5000' }}
+        DAYS_BACK: ${{ github.event.inputs.days_back || '1' }}
+      run: |
+        echo "================================="
+        echo "🚀 RFP Discovery Configuration"
+        echo "================================="
+        echo "Mode: ${DISCOVERY_MODE}"
+        echo "Max RFPs: ${MAX_RFPS}"
+        echo "Days Back: ${DAYS_BACK}"
+        echo "================================="
+        
+        if [ "${DISCOVERY_MODE}" == "test" ]; then
+          echo "🧪 Running in TEST mode (20 RFPs)..."
+          python scripts/working_overkill.py --test
+        elif [ "${DISCOVERY_MODE}" == "overkill" ]; then
+          echo "🔥 OVERKILL MODE ACTIVATED - Processing ALL RFPs!"
+          # Use working_overkill.py from scripts folder with reorganized imports
+          python scripts/working_overkill.py --date $(date -d "yesterday" +%m/%d/%Y) --max ${MAX_RFPS}
+        else
+          echo "📋 Running normal discovery with filters..."
+          python scripts/daily_discovery.py --once --max-rfps ${MAX_RFPS} --days-back ${DAYS_BACK}
+        fi
+    
+    - name: Run Sheet Maintenance
+      env:
+        GOOGLE_SHEETS_CREDS_PATH: /tmp/google-credentials.json
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        MAYBE_SPREADSHEET_ID: ${{ secrets.MAYBE_SPREADSHEET_ID }}
+        GRAVEYARD_SHEET_ID: ${{ secrets.GRAVEYARD_SHEET_ID }}
+        BANK_SHEET_ID: ${{ secrets.BANK_SHEET_ID }}
+      run: |
+        echo "================================="
+        echo "🔧 Running Sheet Maintenance"
+        echo "================================="
+        echo "Updating statuses, applying colors, and archiving old RFPs..."
+        python utilities/daily_sheet_maintenance.py
+        echo "Sheet maintenance complete!"
+    
+    - name: Upload logs as artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: discovery-logs
+        path: |
+          daily_discovery.log
+          sheet_maintenance.log
+          *.log
+        retention-days: 7
+    
+    - name: Notify on failure
+      if: failure()
+      run: |
+        echo "RFP Discovery failed! Check the logs for details."
+        # You could add email/Slack notification here if desired

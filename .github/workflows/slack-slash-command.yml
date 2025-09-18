@@ -1,0 +1,69 @@
+name: Slack Slash Command Handler
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Slack command'
+        required: true
+        default: '/import-rfp'
+      text:
+        description: 'SAM.gov URL'
+        required: true
+      user:
+        description: 'User who ran command'
+        required: false
+        default: 'slack'
+
+jobs:
+  process-import:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install requests google-auth google-auth-oauthlib
+        pip install google-api-python-client openai beautifulsoup4
+    
+    - name: Set up credentials
+      env:
+        GOOGLE_SHEETS_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDS }}
+        GOOGLE_DRIVE_CREDS: ${{ secrets.GOOGLE_DRIVE_CREDS }}
+      run: |
+        echo "$GOOGLE_SHEETS_CREDS" > /tmp/google-sheets-credentials.json
+        echo "$GOOGLE_DRIVE_CREDS" > /tmp/google-drive-credentials.json
+    
+    - name: Send Processing Message
+      run: |
+        curl -X POST https://hooks.slack.com/services/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 \
+          -H 'Content-Type: application/json' \
+          -d "{\"text\": \"🔄 Processing import from ${{ github.event.inputs.user }}...\\nURL: ${{ github.event.inputs.text }}\"}"
+    
+    - name: Run Import
+      env:
+        SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GOOGLE_SHEETS_CREDS_PATH: /tmp/google-sheets-credentials.json
+        GOOGLE_DRIVE_CREDS_PATH: /tmp/google-drive-credentials.json
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        MAYBE_SPREADSHEET_ID: ${{ secrets.MAYBE_SPREADSHEET_ID }}
+        SPAM_SPREADSHEET_ID: ${{ secrets.SPAM_SPREADSHEET_ID }}
+        DAILY_RFPS_FOLDER_ID: ${{ secrets.DAILY_RFPS_FOLDER_ID }}
+      run: |
+        OUTPUT=$(python scripts/import_rfp.py "${{ github.event.inputs.text }}" --user "${{ github.event.inputs.user }}" 2>&1 || true)
+        
+        # Escape the output for JSON
+        OUTPUT_ESCAPED=$(echo "$OUTPUT" | python -c 'import sys, json; print(json.dumps(sys.stdin.read()))')
+        
+        # Send result to Slack
+        curl -X POST https://hooks.slack.com/services/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 \
+          -H 'Content-Type: application/json' \
+          -d "{\"text\": $OUTPUT_ESCAPED}"

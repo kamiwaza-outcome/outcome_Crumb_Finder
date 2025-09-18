@@ -1,0 +1,99 @@
+name: Import RFP from SAM.gov
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'SAM.gov opportunity URL'
+        required: true
+        type: string
+      user:
+        description: 'User requesting import'
+        required: false
+        default: 'Manual'
+        type: string
+      slack_response_url:
+        description: 'Slack response URL for webhook'
+        required: false
+        type: string
+
+jobs:
+  import-rfp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install google-auth google-auth-oauthlib google-auth-httplib2
+        pip install google-api-python-client
+        pip install openai
+        pip install requests
+        pip install beautifulsoup4
+        pip install psutil
+    
+    - name: Set up Google credentials
+      env:
+        GOOGLE_SHEETS_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDS }}
+        GOOGLE_DRIVE_CREDS: ${{ secrets.GOOGLE_DRIVE_CREDS }}
+      run: |
+        echo "$GOOGLE_SHEETS_CREDS" > /tmp/google-sheets-credentials.json
+        echo "$GOOGLE_DRIVE_CREDS" > /tmp/google-drive-credentials.json
+        echo "Credentials files created"
+    
+    - name: Import RFP
+      env:
+        SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GOOGLE_SHEETS_CREDS_PATH: /tmp/google-sheets-credentials.json
+        GOOGLE_DRIVE_CREDS_PATH: /tmp/google-drive-credentials.json
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        MAYBE_SPREADSHEET_ID: ${{ secrets.MAYBE_SPREADSHEET_ID }}
+        SPAM_SPREADSHEET_ID: ${{ secrets.SPAM_SPREADSHEET_ID }}
+        DAILY_RFPS_FOLDER_ID: ${{ secrets.DAILY_RFPS_FOLDER_ID }}
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: |
+        echo "========================================="
+        echo "📥 Importing RFP from SAM.gov"
+        echo "========================================="
+        echo "URL: ${{ github.event.inputs.url }}"
+        echo "User: ${{ github.event.inputs.user }}"
+        echo ""
+        
+        # Run the import script
+        if [ -n "${{ github.event.inputs.slack_response_url }}" ]; then
+          python import_rfp.py \
+            "${{ github.event.inputs.url }}" \
+            --user "${{ github.event.inputs.user }}" \
+            --slack-response-url "${{ github.event.inputs.slack_response_url }}"
+        else
+          python import_rfp.py \
+            "${{ github.event.inputs.url }}" \
+            --user "${{ github.event.inputs.user }}"
+        fi
+    
+    - name: Upload logs as artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: import-logs
+        path: |
+          *.log
+        retention-days: 7

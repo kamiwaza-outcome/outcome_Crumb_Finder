@@ -1,0 +1,71 @@
+name: Slack Command Handler
+
+on:
+  repository_dispatch:
+    types: [slack-command]
+
+jobs:
+  handle-import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install google-auth google-auth-oauthlib google-auth-httplib2
+        pip install google-api-python-client
+        pip install openai
+        pip install requests
+        pip install beautifulsoup4
+        pip install psutil
+    
+    - name: Set up Google credentials
+      env:
+        GOOGLE_SHEETS_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDS }}
+        GOOGLE_DRIVE_CREDS: ${{ secrets.GOOGLE_DRIVE_CREDS }}
+      run: |
+        echo "$GOOGLE_SHEETS_CREDS" > /tmp/google-sheets-credentials.json
+        echo "$GOOGLE_DRIVE_CREDS" > /tmp/google-drive-credentials.json
+    
+    - name: Process Command
+      env:
+        SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GOOGLE_SHEETS_CREDS_PATH: /tmp/google-sheets-credentials.json
+        GOOGLE_DRIVE_CREDS_PATH: /tmp/google-drive-credentials.json
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        MAYBE_SPREADSHEET_ID: ${{ secrets.MAYBE_SPREADSHEET_ID }}
+        SPAM_SPREADSHEET_ID: ${{ secrets.SPAM_SPREADSHEET_ID }}
+        DAILY_RFPS_FOLDER_ID: ${{ secrets.DAILY_RFPS_FOLDER_ID }}
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: |
+        COMMAND="${{ github.event.client_payload.command }}"
+        TEXT="${{ github.event.client_payload.text }}"
+        USER="${{ github.event.client_payload.user }}"
+        RESPONSE_URL="${{ github.event.client_payload.response_url }}"
+        
+        if [ "$COMMAND" = "/import-rfp" ]; then
+          echo "Processing import for: $TEXT"
+          
+          # Send immediate response
+          curl -X POST "$RESPONSE_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "🔄 Processing import... This may take a minute."}'
+          
+          # Run the import
+          OUTPUT=$(python scripts/import_rfp.py "$TEXT" --user "$USER" 2>&1)
+          
+          # Send result back to Slack
+          curl -X POST "$RESPONSE_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"$OUTPUT\", \"response_type\": \"in_channel\"}"
+        fi

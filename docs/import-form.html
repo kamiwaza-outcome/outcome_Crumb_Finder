@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RFP Import Tool</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f6f8fa;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #24292e;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            color: #586069;
+            margin-bottom: 30px;
+        }
+        input[type="url"] {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: 1px solid #d1d5da;
+            border-radius: 6px;
+            box-sizing: border-box;
+        }
+        button {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-top: 15px;
+            width: 100%;
+        }
+        button:hover {
+            background: #2ea043;
+        }
+        button:disabled {
+            background: #94d3a2;
+            cursor: not-allowed;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 6px;
+            display: none;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.processing {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+        .example {
+            font-size: 12px;
+            color: #6a737d;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 RFP Import Tool</h1>
+        <p class="subtitle">Import RFPs from SAM.gov directly to Google Sheets</p>
+        
+        <form id="importForm">
+            <label for="url">SAM.gov URL:</label>
+            <input type="url" 
+                   id="url" 
+                   name="url" 
+                   placeholder="https://sam.gov/opp/..." 
+                   pattern="https://sam\.gov/.*" 
+                   required>
+            <p class="example">Example: https://sam.gov/opp/a3069f8bfcc64e45b5455896b2c3094/view</p>
+            
+            <button type="submit" id="submitBtn">Import RFP</button>
+        </form>
+        
+        <div id="status" class="status"></div>
+    </div>
+
+    <script>
+        const form = document.getElementById('importForm');
+        const status = document.getElementById('status');
+        const submitBtn = document.getElementById('submitBtn');
+        
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const url = document.getElementById('url').value;
+            
+            // Show processing status
+            status.className = 'status processing';
+            status.style.display = 'block';
+            status.innerHTML = '🔄 Processing import request...';
+            submitBtn.disabled = true;
+            
+            try {
+                // Send to Slack webhook
+                const webhookUrl = 'https://hooks.slack.com/services/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';
+                
+                const response = await fetch(webhookUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        text: `📥 Import Request (via Web Form)\nURL: ${url}\n\nRun: \`python scripts/import_rfp.py "${url}"\``
+                    })
+                });
+                
+                if (response.ok) {
+                    status.className = 'status success';
+                    status.innerHTML = '✅ Import request sent to Slack!<br>Check the #rfp-adder channel for updates.';
+                    
+                    // Trigger GitHub Action
+                    status.innerHTML += '<br><br>📋 To complete import, run in terminal:<br><code>python scripts/import_rfp.py "' + url + '"</code>';
+                } else {
+                    throw new Error('Failed to send to Slack');
+                }
+                
+            } catch (error) {
+                status.className = 'status error';
+                status.innerHTML = '❌ Error: ' + error.message;
+            } finally {
+                submitBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

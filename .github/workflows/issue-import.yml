@@ -1,0 +1,68 @@
+name: Import RFP from Issue
+
+on:
+  issues:
+    types: [opened, edited]
+
+jobs:
+  check-and-import:
+    if: contains(github.event.issue.title, 'import-rfp')
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Extract URL from Issue
+      id: extract
+      run: |
+        # Extract SAM.gov URL from issue body
+        URL=$(echo "${{ github.event.issue.body }}" | grep -oE 'https://sam\.gov/[^ ]+' | head -1)
+        echo "url=$URL" >> $GITHUB_OUTPUT
+        echo "Found URL: $URL"
+    
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install requests google-auth google-auth-oauthlib
+        pip install google-api-python-client openai beautifulsoup4
+    
+    - name: Set up credentials
+      env:
+        GOOGLE_SHEETS_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDS }}
+        GOOGLE_DRIVE_CREDS: ${{ secrets.GOOGLE_DRIVE_CREDS }}
+      run: |
+        echo "$GOOGLE_SHEETS_CREDS" > /tmp/google-sheets-credentials.json
+        echo "$GOOGLE_DRIVE_CREDS" > /tmp/google-drive-credentials.json
+    
+    - name: Run Import
+      env:
+        SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GOOGLE_SHEETS_CREDS_PATH: /tmp/google-sheets-credentials.json
+        GOOGLE_DRIVE_CREDS_PATH: /tmp/google-drive-credentials.json
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        DAILY_RFPS_FOLDER_ID: ${{ secrets.DAILY_RFPS_FOLDER_ID }}
+      run: |
+        python scripts/import_rfp.py "${{ steps.extract.outputs.url }}" --user "${{ github.event.issue.user.login }}"
+    
+    - name: Send to Slack
+      run: |
+        curl -X POST https://hooks.slack.com/services/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 \
+          -H 'Content-Type: application/json' \
+          -d '{"text": "✅ Import completed! Check issue #${{ github.event.issue.number }} for details"}'
+    
+    - name: Close Issue
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.update({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            state: 'closed'
+          })
