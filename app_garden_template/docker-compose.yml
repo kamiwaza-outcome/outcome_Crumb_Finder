@@ -1,0 +1,63 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      platforms: ["linux/amd64", "linux/arm64"]
+    image: ${DOCKER_REGISTRY:-docker.io}/${DOCKER_USERNAME}/rfp-discovery-backend:${VERSION:-latest}
+    ports:
+      - "8000"  # Container port only - App Garden allocates host port
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Kamiwaza integration
+      KAMIWAZA_ENDPOINT: ${KAMIWAZA_ENDPOINT:-http://host.docker.internal:7777/api/}
+      KAMIWAZA_VERIFY_SSL: ${KAMIWAZA_VERIFY_SSL:-false}
+      KAMIWAZA_API_URI: ${KAMIWAZA_API_URI:-https://host.docker.internal/api}
+      KAMIWAZA_FORCE_HTTP: ${KAMIWAZA_FORCE_HTTP:-true}
+      NODE_TLS_REJECT_UNAUTHORIZED: ${NODE_TLS_REJECT_UNAUTHORIZED:-0}
+      # RFP Discovery Configuration
+      SAM_API_KEY: ${SAM_API_KEY}
+      GOOGLE_SHEETS_CREDS_PATH: ${GOOGLE_SHEETS_CREDS_PATH:-/app/credentials.json}
+      SPREADSHEET_ID: ${SPREADSHEET_ID}
+      MAYBE_SPREADSHEET_ID: ${MAYBE_SPREADSHEET_ID}
+      SPAM_SPREADSHEET_ID: ${SPAM_SPREADSHEET_ID}
+      GOOGLE_DRIVE_FOLDER_ID: ${GOOGLE_DRIVE_FOLDER_ID}
+      DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-llama-3.1-70b}
+      DEFAULT_BATCH_SIZE: ${DEFAULT_BATCH_SIZE:-10}
+      DEFAULT_MAX_RFPS: ${DEFAULT_MAX_RFPS:-200}
+    volumes:
+      # Persistent data for RFP daemon
+      - rfp_data:/app/data
+      # Google credentials (if using file-based auth)
+      - ./credentials.json:/app/credentials.json:ro
+      # Company configuration
+      - ../company_config.json:/app/company_config.json:ro
+      - ../data/winning_rfps.txt:/app/data/winning_rfps.txt:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      platforms: ["linux/amd64", "linux/arm64"]
+    image: ${DOCKER_REGISTRY:-docker.io}/${DOCKER_USERNAME}/rfp-discovery-frontend:${VERSION:-latest}
+    ports:
+      - "3000"  # Container port only - App Garden allocates host port
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # Backend URL for the API proxy
+      BACKEND_URL: http://backend:8000
+      NODE_TLS_REJECT_UNAUTHORIZED: ${NODE_TLS_REJECT_UNAUTHORIZED:-0}
+
+networks:
+  default:
+    name: rfp_discovery_network
+
+volumes:
+  rfp_data:
+    name: rfp_discovery_data
