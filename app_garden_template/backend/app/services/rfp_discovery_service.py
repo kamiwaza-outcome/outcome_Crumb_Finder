@@ -24,8 +24,7 @@ from app.models.rfp import (
     QualificationLevel,
     RFPDiscoveryRun,
     RunStatus,
-    RFPSearchRequest,
-    RFP
+    RFPSearchRequest
 )
 from app.core.errors import ServiceError, AIServiceError
 
@@ -138,8 +137,7 @@ SAM UEI: {profile.sam_uei or 'Not specified'}
             # Push to Google Sheets if configured
             if self.sheets_service and self.sheets_service.is_configured():
                 logger.info("Pushing RFPs to Google Sheets...")
-                rfps_for_sheets = self._convert_to_rfp_models(processed_rfps)
-                sheet_results = self.sheets_service.push_qualified_rfps(rfps_for_sheets)
+                sheet_results = self.sheets_service.push_qualified_rfps(processed_rfps)
                 logger.info(f"Google Sheets update: {sheet_results}")
 
             run.status = RunStatus.COMPLETED
@@ -654,28 +652,3 @@ Output ONLY valid JSON, no other text."""
             logger.debug(f"Could not parse date '{date_str}': {e}")
 
         return None
-    def _convert_to_rfp_models(self, processed_rfps: List[ProcessedRFP]) -> List[RFP]:
-        """Convert ProcessedRFP objects to RFP models for Google Sheets"""
-        rfp_models = []
-
-        for processed in processed_rfps:
-            rfp = RFP(
-                notice_id=processed.opportunity.notice_id,
-                title=processed.opportunity.title,
-                agency=processed.opportunity.agency,
-                posted_date=processed.opportunity.posted_date,
-                response_deadline=processed.opportunity.response_deadline,
-                naics_code=processed.opportunity.naics_code,
-                solicitation_number=processed.opportunity.solicitation_number,
-                url=processed.opportunity.url,
-                description=processed.opportunity.description,
-                ai_score=processed.assessment.relevance_score,
-                ai_justification=processed.assessment.justification,
-                key_requirements=processed.assessment.key_requirements,
-                suggested_approach=processed.assessment.suggested_approach,
-                qualification_level=processed.assessment.qualification_level.value,
-                discovered_at=datetime.now()
-            )
-            rfp_models.append(rfp)
-
-        return rfp_models

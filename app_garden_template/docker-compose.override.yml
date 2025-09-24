@@ -1,0 +1,22 @@
+# Local development override - exposes ports for direct access
+# This file is automatically used by docker-compose in development
+# In production/App Garden, this file is not used
+
+services:
+  backend:
+    ports:
+      - "8002:8000"  # Maps container port 8000 to host port 8002
+    environment:
+      # Development mode
+      ENV: development
+      LOG_LEVEL: DEBUG
+    volumes:
+      # Mount source code for hot reload in development
+      - ./backend/app:/app/app:ro
+
+  frontend:
+    ports:
+      - "3002:3000"  # Maps container port 3000 to host port 3002
+    environment:
+      # Development mode
+      NODE_ENV: development

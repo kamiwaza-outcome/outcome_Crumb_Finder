@@ -11,7 +11,7 @@ from googleapiclient.errors import HttpError
 import ssl
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from app.models.rfp import RFP
+from app.models.rfp import ProcessedRFP, RFPOpportunity, RFPAssessment
 from app.models.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -161,7 +161,7 @@ class SheetsService:
             logger.warning(f"Could not read Notice IDs from {sheet_id}: {str(e)}")
             return set()
 
-    def add_rfp_to_sheet(self, rfp: RFP, sheet_id: str, sheet_type: str) -> bool:
+    def add_rfp_to_sheet(self, rfp: ProcessedRFP, sheet_id: str, sheet_type: str) -> bool:
         """Add an RFP to the specified Google Sheet"""
         if not self.is_configured() or not sheet_id:
             logger.info(f"Skipping sheet update - not configured or no sheet ID for {sheet_type}")
@@ -170,20 +170,20 @@ class SheetsService:
         try:
             # Prepare row data
             row_data = [[
-                rfp.url or '',  # Source/URL
-                (rfp.title or '')[:200],  # Title (truncated)
-                rfp.agency or '',  # Agency
-                rfp.posted_date or '',  # Posted Date
-                rfp.response_deadline or '',  # Due Date
-                '',  # Estimated Value (not in RFP model)
-                rfp.naics_code or '',  # NAICS
-                '',  # Location (not in RFP model)
-                str(rfp.ai_score) if rfp.ai_score else '',  # AI Score
-                (rfp.ai_justification or '')[:500],  # AI Justification (truncated)
-                ', '.join(rfp.key_requirements or [])[:300],  # Key Requirements
-                (rfp.suggested_approach or '')[:300],  # Suggested Approach
+                rfp.opportunity.url or '',  # Source/URL
+                (rfp.opportunity.title or '')[:200],  # Title (truncated)
+                rfp.opportunity.agency or '',  # Agency
+                rfp.opportunity.posted_date or '',  # Posted Date
+                rfp.opportunity.response_deadline or '',  # Due Date
+                '',  # Estimated Value (not in ProcessedRFP model)
+                rfp.opportunity.naics_code or '',  # NAICS
+                '',  # Location (not in ProcessedRFP model)
+                str(rfp.assessment.relevance_score) if rfp.assessment.relevance_score else '',  # AI Score
+                (rfp.assessment.justification or '')[:500],  # AI Justification (truncated)
+                ', '.join(rfp.assessment.key_requirements or [])[:300],  # Key Requirements
+                (rfp.assessment.suggested_approach or '')[:300],  # Suggested Approach
                 sheet_type.capitalize(),  # Status (based on sheet type)
-                rfp.notice_id or '',  # Notice ID
+                rfp.opportunity.notice_id or '',  # Notice ID
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Date Added
             ]]
 
@@ -197,14 +197,14 @@ class SheetsService:
             )
             execute_with_retry(request)
 
-            logger.info(f"Added RFP {rfp.notice_id} to {sheet_type} sheet")
+            logger.info(f"Added RFP {rfp.opportunity.notice_id} to {sheet_type} sheet")
             return True
 
         except Exception as e:
             logger.error(f"Failed to add RFP to {sheet_type} sheet: {str(e)}")
             return False
 
-    def push_qualified_rfps(self, rfps: List[RFP]) -> Dict[str, int]:
+    def push_qualified_rfps(self, rfps: List[ProcessedRFP]) -> Dict[str, int]:
         """Push qualified RFPs to appropriate sheets"""
         if not self.is_configured():
             logger.info("Google Sheets not configured - skipping push")
@@ -236,19 +236,19 @@ class SheetsService:
         # Process each RFP
         for rfp in rfps:
             # Skip if already in any sheet
-            if rfp.notice_id in qualified_existing or \
-               rfp.notice_id in maybe_existing or \
-               rfp.notice_id in rejected_existing:
-                logger.info(f"Skipping duplicate RFP {rfp.notice_id}")
+            if rfp.opportunity.notice_id in qualified_existing or \
+               rfp.opportunity.notice_id in maybe_existing or \
+               rfp.opportunity.notice_id in rejected_existing:
+                logger.info(f"Skipping duplicate RFP {rfp.opportunity.notice_id}")
                 continue
 
             # Determine which sheet based on AI score
-            if rfp.ai_score >= 7:
+            if rfp.assessment.relevance_score >= 7:
                 # High score - qualified
                 if sheets_config.qualified_sheet_id:
                     if self.add_rfp_to_sheet(rfp, sheets_config.qualified_sheet_id, 'qualified'):
                         results['qualified'] += 1
-            elif rfp.ai_score >= 4:
+            elif rfp.assessment.relevance_score >= 4:
                 # Medium score - maybe
                 if sheets_config.maybe_sheet_id:
                     if self.add_rfp_to_sheet(rfp, sheets_config.maybe_sheet_id, 'maybe'):
@@ -264,7 +264,7 @@ class SheetsService:
 
         return results
 
-    def add_to_graveyard(self, rfp: RFP) -> bool:
+    def add_to_graveyard(self, rfp: ProcessedRFP) -> bool:
         """Add expired or lost RFP to graveyard sheet"""
         if not self.is_configured():
             return False
@@ -276,7 +276,7 @@ class SheetsService:
         self.setup_sheet_if_needed(graveyard_sheet_id, 'graveyard')
         return self.add_rfp_to_sheet(rfp, graveyard_sheet_id, 'graveyard')
 
-    def add_to_bank(self, rfp: RFP) -> bool:
+    def add_to_bank(self, rfp: ProcessedRFP) -> bool:
         """Add RFP to bank sheet for historical reference"""
         if not self.is_configured():
             return False

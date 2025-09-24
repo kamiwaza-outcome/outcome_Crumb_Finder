@@ -1,7 +1,12 @@
 FROM python:3.11-slim
 
-# Install git for pip and curl for healthcheck
-RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
+# Install git for pip, curl for healthcheck, and build tools for psutil
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
 RUN useradd -m -u 1001 appuser
