@@ -5,12 +5,12 @@ from typing import List, Optional, Dict
 
 
 class GoogleSheetsConfig(BaseModel):
-    """Configuration for different Google Sheets"""
-    rfp_tracking_sheet_id: str = Field(default="", description="Google Sheet for tracking discovered RFPs")
-    opportunity_pipeline_sheet_id: str = Field(default="", description="Google Sheet for opportunity pipeline management")
-    win_loss_analysis_sheet_id: str = Field(default="", description="Google Sheet for win/loss analysis")
-    competitor_tracking_sheet_id: str = Field(default="", description="Google Sheet for competitor tracking")
-    reporting_dashboard_sheet_id: str = Field(default="", description="Google Sheet for reporting and metrics")
+    """Configuration for RFP workflow sheets"""
+    qualified_sheet_id: str = Field(default="", description="Main findings - qualified RFPs to pursue")
+    maybe_sheet_id: str = Field(default="", description="Maybe pile - RFPs needing further review")
+    rejected_sheet_id: str = Field(default="", description="Rejected/spam - irrelevant RFPs")
+    graveyard_sheet_id: str = Field(default="", description="Graveyard - lost/expired opportunities")
+    bank_sheet_id: str = Field(default="", description="Bank - historical RFP data for analysis")
 
 
 class APIKeys(BaseModel):

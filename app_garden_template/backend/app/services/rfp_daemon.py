@@ -1,122 +1,135 @@
 """
-RFP Discovery Daemon Service
-Continuously running service for scheduled RFP discovery
+RFP Discovery Daemon Service - FIXED VERSION
+Handles scheduled and on-demand RFP discovery with proper connection management
 """
 
 import asyncio
-import json
-import logging
-import os
 import sqlite3
+import json
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
-from pathlib import Path
+from contextlib import contextmanager
+import logging
+
 from croniter import croniter
 
-from app.services.rfp_discovery_service import RFPDiscoveryService
-from app.services.kamiwaza_service import KamiwazaService
 from app.models.rfp import (
+    RFPSearchRequest,
     RFPDiscoveryRun,
     RFPSchedule,
     DaemonStatus,
-    RFPSearchRequest,
-    RunStatus,
-    RFPLogEntry,
-    RFPRunLogs
+    RunStatus
 )
+from app.services.rfp_discovery_service import RFPDiscoveryService
+from app.services.kamiwaza_service import KamiwazaService
 
 logger = logging.getLogger(__name__)
 
 
 class RFPDaemon:
-    """Daemon service for continuous RFP discovery"""
+    """Background daemon for scheduled RFP discovery"""
 
-    def __init__(self, data_dir: str = "data/rfp_daemon"):
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-
-        self.db_path = self.data_dir / "rfp_daemon.db"
+    def __init__(self, db_path: str = "data/rfp_daemon/rfp_daemon.db"):
+        self.db_path = db_path
         self.is_running = False
-        self.current_run: Optional[RFPDiscoveryRun] = None
         self.start_time = None
-        self.schedules: Dict[str, RFPSchedule] = {}
+        self.current_run: Optional[RFPDiscoveryRun] = None
         self.recent_runs: List[RFPDiscoveryRun] = []
-        self.max_recent_runs = 10
+        self.schedules: Dict[str, RFPSchedule] = {}
+
+        # Async management
+        self.scheduler_task = None
+        self.monitor_task = None
+        self.shutdown_event = asyncio.Event()
+
+        # FIX: Add locks to prevent race conditions
+        self.schedule_locks: Dict[str, asyncio.Lock] = {}
+        self.run_lock = asyncio.Lock()  # Prevent multiple concurrent runs
+
+        # Services
+        self.kamiwaza_service = KamiwazaService()
+        self.discovery_service = RFPDiscoveryService(self.kamiwaza_service)
 
         # Initialize database
         self._init_database()
 
-        # Initialize services
-        self.kamiwaza_service = KamiwazaService()
-        self.discovery_service = RFPDiscoveryService(self.kamiwaza_service)
-
-        # Event for graceful shutdown
-        self.shutdown_event = asyncio.Event()
-
-        # Background tasks
-        self.scheduler_task = None
-        self.monitor_task = None
+    @contextmanager
+    def get_db_connection(self):
+        """Context manager for database connections to prevent leaks"""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row  # Enable column access by name
+            yield conn
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            raise e
+        finally:
+            if conn:
+                conn.close()
 
     def _init_database(self):
         """Initialize SQLite database for persistent state"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
 
-        # Create tables
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS rfp_runs (
-                run_id TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL,
-                completed_at TEXT,
-                status TEXT NOT NULL,
-                total_found INTEGER DEFAULT 0,
-                total_processed INTEGER DEFAULT 0,
-                total_qualified INTEGER DEFAULT 0,
-                total_maybe INTEGER DEFAULT 0,
-                total_rejected INTEGER DEFAULT 0,
-                total_errors INTEGER DEFAULT 0,
-                processing_time_seconds REAL,
-                search_config TEXT,
-                errors TEXT
-            )
-        """)
+            # Create tables
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS rfp_runs (
+                    run_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL,
+                    total_found INTEGER DEFAULT 0,
+                    total_processed INTEGER DEFAULT 0,
+                    total_qualified INTEGER DEFAULT 0,
+                    total_maybe INTEGER DEFAULT 0,
+                    total_rejected INTEGER DEFAULT 0,
+                    total_errors INTEGER DEFAULT 0,
+                    processing_time_seconds REAL,
+                    search_config TEXT,
+                    errors TEXT
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS rfp_schedules (
-                schedule_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                cron_expression TEXT NOT NULL,
-                enabled BOOLEAN DEFAULT 1,
-                search_config TEXT NOT NULL,
-                last_run TEXT,
-                next_run TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS rfp_schedules (
+                    schedule_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    run_mode TEXT DEFAULT 'normal',
+                    cron_expression TEXT NOT NULL,
+                    enabled BOOLEAN DEFAULT 1,
+                    search_config TEXT NOT NULL,
+                    last_run TEXT,
+                    next_run TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS rfp_logs (
-                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                level TEXT NOT NULL,
-                message TEXT NOT NULL,
-                details TEXT,
-                FOREIGN KEY (run_id) REFERENCES rfp_runs (run_id)
-            )
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS rfp_logs (
+                    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    details TEXT,
+                    FOREIGN KEY (run_id) REFERENCES rfp_runs (run_id)
+                )
+            """)
 
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_logs_run_id ON rfp_logs (run_id)
-        """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_logs_run_id ON rfp_logs (run_id)
+            """)
 
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON rfp_logs (timestamp)
-        """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON rfp_logs (timestamp)
+            """)
 
-        conn.commit()
-        conn.close()
+            conn.commit()
 
     async def start(self):
         """Start the daemon service"""
@@ -130,6 +143,9 @@ class RFPDaemon:
 
         # Load schedules from database
         self._load_schedules()
+
+        # FIX: Cancel any existing tasks before creating new ones
+        await self._cleanup_tasks()
 
         # Start background tasks
         self.scheduler_task = asyncio.create_task(self._scheduler_loop())
@@ -149,109 +165,192 @@ class RFPDaemon:
         # Signal shutdown
         self.shutdown_event.set()
 
-        # Cancel background tasks
-        if self.scheduler_task:
-            self.scheduler_task.cancel()
-            try:
-                await self.scheduler_task
-            except asyncio.CancelledError:
-                pass
-
-        if self.monitor_task:
-            self.monitor_task.cancel()
-            try:
-                await self.monitor_task
-            except asyncio.CancelledError:
-                pass
+        # Clean up tasks
+        await self._cleanup_tasks()
 
         logger.info("RFP Daemon stopped")
 
-    async def _scheduler_loop(self):
-        """Main scheduler loop that runs scheduled discoveries"""
-        while self.is_running:
+    async def _cleanup_tasks(self):
+        """Clean up background tasks properly"""
+        tasks_to_cancel = []
+
+        if self.scheduler_task:
+            tasks_to_cancel.append(self.scheduler_task)
+            self.scheduler_task = None
+
+        if self.monitor_task:
+            tasks_to_cancel.append(self.monitor_task)
+            self.monitor_task = None
+
+        for task in tasks_to_cancel:
+            task.cancel()
             try:
-                # Check each schedule
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _scheduler_loop(self):
+        """Main scheduler loop that checks and executes schedules"""
+        logger.info("Scheduler loop started")
+
+        while not self.shutdown_event.is_set():
+            try:
+                now = datetime.now()
+
                 for schedule_id, schedule in self.schedules.items():
                     if not schedule.enabled:
                         continue
 
-                    # Check if it's time to run
-                    now = datetime.now()
-                    if self._should_run_schedule(schedule, now):
-                        logger.info(f"Triggering scheduled run: {schedule.name}")
-                        asyncio.create_task(
-                            self._run_discovery(schedule.search_config, schedule_id)
-                        )
+                    # FIX: Create lock for each schedule if not exists
+                    if schedule_id not in self.schedule_locks:
+                        self.schedule_locks[schedule_id] = asyncio.Lock()
 
-                        # Update last run time
-                        schedule.last_run = now
-                        schedule.next_run = self._calculate_next_run(schedule.cron_expression)
-                        self._update_schedule_in_db(schedule)
+                    # FIX: Use lock to prevent race condition
+                    if self.schedule_locks[schedule_id].locked():
+                        logger.debug(f"Schedule {schedule_id} is already running, skipping")
+                        continue
 
-                # Sleep for a minute before checking again
-                await asyncio.sleep(60)
+                    async with self.schedule_locks[schedule_id]:
+                        if self._should_run_schedule(schedule, now):
+                            logger.info(f"Triggering scheduled run: {schedule.name}")
+                            # Don't await here - let it run in background
+                            asyncio.create_task(
+                                self._run_discovery_with_lock(schedule.search_config, schedule_id)
+                            )
+                            # Update last_run time immediately to prevent re-triggering
+                            self._update_schedule_last_run(schedule_id, now)
 
-            except asyncio.CancelledError:
-                break
+                await asyncio.sleep(5)  # Check every 5 seconds
+
             except Exception as e:
                 logger.error(f"Error in scheduler loop: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(5)
 
-    async def _monitor_loop(self):
-        """Monitor system resources and cleanup old data"""
-        while self.is_running:
-            try:
-                # Cleanup old logs (keep last 7 days)
-                self._cleanup_old_logs(days=7)
-
-                # Cleanup old runs (keep last 30 days)
-                self._cleanup_old_runs(days=30)
-
-                # Log system metrics
-                metrics = self.get_system_metrics()
-                logger.debug(f"System metrics: {metrics}")
-
-                # Sleep for 5 minutes
-                await asyncio.sleep(300)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in monitor loop: {e}")
-                await asyncio.sleep(300)
+    async def _run_discovery_with_lock(self, search_config: RFPSearchRequest, schedule_id: Optional[str] = None):
+        """Wrapper to run discovery with proper locking"""
+        try:
+            await self._run_discovery(search_config, schedule_id)
+        except Exception as e:
+            logger.error(f"Discovery run failed: {e}")
 
     def _should_run_schedule(self, schedule: RFPSchedule, now: datetime) -> bool:
         """Check if a schedule should run now"""
-        if not schedule.enabled:
+        try:
+            cron = croniter(schedule.cron_expression, now)
+
+            # Get the last scheduled time
+            prev_time = cron.get_prev(datetime)
+
+            # Check if we haven't run since the last scheduled time
+            if schedule.last_run:
+                # Handle both string and datetime objects
+                if isinstance(schedule.last_run, str):
+                    last_run = datetime.fromisoformat(schedule.last_run)
+                else:
+                    last_run = schedule.last_run
+                if last_run >= prev_time:
+                    return False
+
+            # Check if we're within 60 seconds of the scheduled time
+            time_diff = (now - prev_time).total_seconds()
+            return time_diff < 60
+
+        except Exception as e:
+            logger.error(f"Error checking schedule {schedule.schedule_id}: {e}")
             return False
 
-        # If never run, run now
-        if not schedule.last_run:
-            return True
+    def _update_schedule_last_run(self, schedule_id: str, run_time: datetime):
+        """Update schedule's last run time"""
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE rfp_schedules
+                SET last_run = ?
+                WHERE schedule_id = ?
+            """, (run_time.isoformat(), schedule_id))
+            conn.commit()
 
-        # Check cron expression
-        cron = croniter(schedule.cron_expression, schedule.last_run)
-        next_run = cron.get_next(datetime)
+        if schedule_id in self.schedules:
+            self.schedules[schedule_id].last_run = run_time.isoformat()
 
-        return now >= next_run
+    async def _monitor_loop(self):
+        """Monitor loop for cleanup and maintenance"""
+        logger.info("Monitor loop started")
 
-    def _calculate_next_run(self, cron_expression: str) -> datetime:
-        """Calculate next run time based on cron expression"""
-        cron = croniter(cron_expression, datetime.now())
-        return cron.get_next(datetime)
+        while not self.shutdown_event.is_set():
+            try:
+                # Clean up old logs and runs
+                self._cleanup_old_data()
+
+                # Update next run times for schedules
+                self._update_next_run_times()
+
+                await asyncio.sleep(3600)  # Run every hour
+
+            except Exception as e:
+                logger.error(f"Error in monitor loop: {e}")
+                await asyncio.sleep(3600)
+
+    def _cleanup_old_data(self):
+        """Clean up old runs and logs"""
+        try:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+
+                # Delete logs older than 7 days
+                seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
+                cursor.execute("""
+                    DELETE FROM rfp_logs
+                    WHERE timestamp < ?
+                """, (seven_days_ago,))
+
+                # Delete runs older than 30 days
+                thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+                cursor.execute("""
+                    DELETE FROM rfp_runs
+                    WHERE started_at < ?
+                """, (thirty_days_ago,))
+
+                conn.commit()
+
+        except Exception as e:
+            logger.error(f"Error cleaning up old data: {e}")
+
+    def _update_next_run_times(self):
+        """Update next run times for all schedules"""
+        now = datetime.now()
+
+        for schedule_id, schedule in self.schedules.items():
+            if schedule.enabled:
+                try:
+                    cron = croniter(schedule.cron_expression, now)
+                    next_time = cron.get_next(datetime)
+                    schedule.next_run = next_time.isoformat()
+
+                    with self.get_db_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            UPDATE rfp_schedules
+                            SET next_run = ?
+                            WHERE schedule_id = ?
+                        """, (next_time.isoformat(), schedule_id))
+                        conn.commit()
+
+                except Exception as e:
+                    logger.error(f"Error updating next run time for {schedule_id}: {e}")
 
     async def _run_discovery(self, search_config: RFPSearchRequest, schedule_id: Optional[str] = None):
-        """Run a discovery job"""
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        """Execute an RFP discovery run"""
+        # FIX: Use run lock to prevent concurrent discovery runs
+        async with self.run_lock:
+            if self.current_run:
+                raise Exception("A discovery run is already in progress")
 
-        if schedule_id:
-            run_id = f"{run_id}_{schedule_id}"
+            run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            if schedule_id:
+                run_id += f"_{schedule_id}"
 
-        # Log start
-        self._log_to_db(run_id, "INFO", f"Starting discovery run {run_id}")
-
-        try:
-            # Set current run
+            # Initialize run
             self.current_run = RFPDiscoveryRun(
                 run_id=run_id,
                 started_at=datetime.now(),
@@ -259,153 +358,180 @@ class RFPDaemon:
                 search_config=search_config
             )
 
-            # Run discovery
-            result = await self.discovery_service.discover_rfps(search_config)
+            # Log to database
+            self._log_run_start(run_id, search_config)
+            self._log_to_db(run_id, "INFO", "Discovery run started")
 
-            # Save to database
-            self._save_run_to_db(result)
+            try:
+                # Execute discovery
+                result = await self.discovery_service.discover_rfps(search_config)
 
-            # Add to recent runs
-            self.recent_runs.insert(0, result)
-            if len(self.recent_runs) > self.max_recent_runs:
-                self.recent_runs.pop()
+                # Update current run with results
+                self.current_run = result
+                self.current_run.status = RunStatus.COMPLETED
+                self.current_run.completed_at = datetime.now()
 
-            # Log completion
-            self._log_to_db(
-                run_id,
-                "INFO",
-                f"Discovery completed: {result.total_qualified} qualified, "
-                f"{result.total_maybe} maybe, {result.total_rejected} rejected"
-            )
+                # Log completion
+                self._log_run_complete(run_id, result)
+                self._log_to_db(run_id, "INFO", f"Discovery completed: {result.total_qualified} qualified RFPs")
 
-            # Update Google Sheets if configured
-            await self._update_google_sheets(result)
+                # Add to recent runs
+                self.recent_runs.insert(0, result)
+                if len(self.recent_runs) > 10:
+                    self.recent_runs = self.recent_runs[:10]
 
-        except Exception as e:
-            logger.error(f"Discovery run {run_id} failed: {e}")
-            self._log_to_db(run_id, "ERROR", f"Discovery failed: {str(e)}")
+            except Exception as e:
+                logger.error(f"Discovery run failed: {e}")
 
-            if self.current_run and self.current_run.run_id == run_id:
-                self.current_run.status = RunStatus.FAILED
-                self.current_run.errors.append({
-                    "error": str(e),
-                    "timestamp": datetime.now().isoformat()
-                })
+                if self.current_run:
+                    self.current_run.status = RunStatus.FAILED
+                    self.current_run.completed_at = datetime.now()
+                    self.current_run.errors.append({"error": str(e)})
 
-        finally:
-            # Clear current run
-            if self.current_run and self.current_run.run_id == run_id:
+                self._log_run_error(run_id, str(e))
+                self._log_to_db(run_id, "ERROR", f"Discovery failed: {e}")
+                raise
+
+            finally:
                 self.current_run = None
 
-    async def _update_google_sheets(self, run: RFPDiscoveryRun):
-        """Update Google Sheets with discovery results"""
+    def _load_schedules(self):
+        """Load schedules from database"""
         try:
-            import sys
-            import os
-            sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM rfp_schedules WHERE enabled = 1")
+                rows = cursor.fetchall()
 
-            from src.sheets_manager import SheetsManager
-            from config import Config
-
-            sheets_manager = SheetsManager(Config.GOOGLE_SHEETS_CREDS_PATH)
-
-            # Update main sheet with qualified RFPs
-            if run.qualified_rfps and Config.SPREADSHEET_ID:
-                for rfp in run.qualified_rfps:
-                    sheets_manager.add_rfp_to_sheet(
-                        spreadsheet_id=Config.SPREADSHEET_ID,
-                        opportunity=rfp.opportunity.dict(),
-                        assessment=rfp.assessment.dict(),
-                        folder_url=rfp.drive_folder_url
+                self.schedules = {}
+                for row in rows:
+                    schedule = RFPSchedule(
+                        schedule_id=row["schedule_id"],
+                        name=row["name"],
+                        cron_expression=row["cron_expression"],
+                        enabled=bool(row["enabled"]),
+                        search_config=RFPSearchRequest(**json.loads(row["search_config"])),
+                        last_run=row["last_run"],
+                        next_run=row["next_run"]
                     )
-                run.sheets_updated["main"] = True
+                    self.schedules[schedule.schedule_id] = schedule
+                    # Create lock for schedule
+                    self.schedule_locks[schedule.schedule_id] = asyncio.Lock()
 
-            # Update maybe sheet
-            if run.maybe_rfps and Config.MAYBE_SPREADSHEET_ID:
-                for rfp in run.maybe_rfps:
-                    sheets_manager.add_rfp_to_sheet(
-                        spreadsheet_id=Config.MAYBE_SPREADSHEET_ID,
-                        opportunity=rfp.opportunity.dict(),
-                        assessment=rfp.assessment.dict(),
-                        folder_url=rfp.drive_folder_url
-                    )
-                run.sheets_updated["maybe"] = True
-
-            # Update spam sheet with all RFPs
-            if Config.SPAM_SPREADSHEET_ID:
-                all_rfps = run.qualified_rfps + run.maybe_rfps + run.rejected_rfps
-                for rfp in all_rfps:
-                    sheets_manager.add_rfp_to_sheet(
-                        spreadsheet_id=Config.SPAM_SPREADSHEET_ID,
-                        opportunity=rfp.opportunity.dict(),
-                        assessment=rfp.assessment.dict(),
-                        folder_url=rfp.drive_folder_url
-                    )
-                run.sheets_updated["spam"] = True
-
-            logger.info(f"Updated Google Sheets: {run.sheets_updated}")
+                logger.info(f"Loaded {len(self.schedules)} schedules from database")
 
         except Exception as e:
-            logger.error(f"Failed to update Google Sheets: {e}")
-
-    def trigger_immediate_run(self, search_config: RFPSearchRequest) -> str:
-        """Trigger an immediate discovery run"""
-        if self.current_run:
-            raise Exception("A discovery run is already in progress")
-
-        # Create task for async execution
-        asyncio.create_task(self._run_discovery(search_config))
-
-        return f"Discovery run triggered at {datetime.now()}"
+            logger.error(f"Error loading schedules: {e}")
+            self.schedules = {}
 
     def add_schedule(self, schedule: RFPSchedule) -> str:
         """Add a new schedule"""
-        # Calculate next run
-        schedule.next_run = self._calculate_next_run(schedule.cron_expression)
+        try:
+            # Generate ID if not provided
+            if not schedule.schedule_id:
+                schedule.schedule_id = f"schedule_{uuid.uuid4().hex[:8]}"
 
-        # Save to database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+            # Save to database
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO rfp_schedules
+                    (schedule_id, name, run_mode, cron_expression, enabled, search_config, last_run, next_run)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    schedule.schedule_id,
+                    schedule.name,
+                    schedule.run_mode if hasattr(schedule, 'run_mode') else 'normal',
+                    schedule.cron_expression,
+                    int(schedule.enabled),
+                    json.dumps(schedule.search_config.dict()),
+                    schedule.last_run,
+                    schedule.next_run
+                ))
+                conn.commit()
 
-        cursor.execute("""
-            INSERT OR REPLACE INTO rfp_schedules
-            (schedule_id, name, cron_expression, enabled, search_config, next_run)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            schedule.schedule_id,
-            schedule.name,
-            schedule.cron_expression,
-            schedule.enabled,
-            json.dumps(schedule.search_config.dict()),
-            schedule.next_run.isoformat() if schedule.next_run else None
-        ))
+            # Add to memory
+            self.schedules[schedule.schedule_id] = schedule
+            self.schedule_locks[schedule.schedule_id] = asyncio.Lock()
 
-        conn.commit()
-        conn.close()
+            # Calculate next run time
+            self._update_next_run_times()
 
-        # Add to memory
-        self.schedules[schedule.schedule_id] = schedule
+            logger.info(f"Added schedule: {schedule.name} ({schedule.schedule_id})")
+            return schedule.schedule_id
 
-        logger.info(f"Added schedule: {schedule.name}")
-        return schedule.schedule_id
+        except Exception as e:
+            logger.error(f"Error adding schedule: {e}")
+            raise
 
-    def remove_schedule(self, schedule_id: str) -> bool:
-        """Remove a schedule"""
-        if schedule_id not in self.schedules:
-            return False
+    def update_schedule(self, schedule_id: str, updates: Dict[str, Any]):
+        """Update an existing schedule"""
+        try:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
 
-        # Remove from database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM rfp_schedules WHERE schedule_id = ?", (schedule_id,))
-        conn.commit()
-        conn.close()
+                # Build update query
+                update_fields = []
+                values = []
 
-        # Remove from memory
-        del self.schedules[schedule_id]
+                for field, value in updates.items():
+                    if field in ["name", "cron_expression", "enabled", "search_config"]:
+                        update_fields.append(f"{field} = ?")
+                        if field == "search_config":
+                            values.append(json.dumps(value) if isinstance(value, dict) else value)
+                        else:
+                            values.append(value)
 
-        logger.info(f"Removed schedule: {schedule_id}")
-        return True
+                if update_fields:
+                    values.append(schedule_id)
+                    query = f"UPDATE rfp_schedules SET {', '.join(update_fields)} WHERE schedule_id = ?"
+                    cursor.execute(query, values)
+                    conn.commit()
+
+                    # Reload schedule
+                    if schedule_id in self.schedules:
+                        self._load_schedules()
+
+                    logger.info(f"Updated schedule: {schedule_id}")
+
+        except Exception as e:
+            logger.error(f"Error updating schedule: {e}")
+            raise
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        """Delete a schedule"""
+        try:
+            # Check if schedule exists
+            if schedule_id not in self.schedules:
+                return False
+
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM rfp_schedules WHERE schedule_id = ?", (schedule_id,))
+                conn.commit()
+
+            # Remove from memory
+            if schedule_id in self.schedules:
+                del self.schedules[schedule_id]
+            if schedule_id in self.schedule_locks:
+                del self.schedule_locks[schedule_id]
+
+            logger.info(f"Deleted schedule: {schedule_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error deleting schedule: {e}")
+            raise
+
+    def trigger_immediate_run(self, search_config: RFPSearchRequest) -> str:
+        """Trigger an immediate discovery run"""
+        if not self.is_running:
+            raise Exception("Daemon is not running")
+
+        # Create a task for the discovery
+        asyncio.create_task(self._run_discovery(search_config))
+
+        return "Discovery run triggered successfully"
 
     def get_status(self) -> DaemonStatus:
         """Get current daemon status"""
@@ -417,193 +543,156 @@ class RFPDaemon:
             current_run=self.current_run,
             recent_runs=self.recent_runs[:10],
             active_schedules=list(self.schedules.values()),
-            system_metrics=self.get_system_metrics()
+            system_metrics={
+                "memory_mb": self._get_memory_usage(),
+                "schedule_count": len(self.schedules),
+                "total_runs": len(self.recent_runs)
+            }
         )
 
-    def get_system_metrics(self) -> Dict[str, Any]:
-        """Get system resource metrics"""
-        import psutil
-
-        process = psutil.Process()
-
-        return {
-            "cpu_percent": process.cpu_percent(),
-            "memory_mb": process.memory_info().rss / 1024 / 1024,
-            "threads": process.num_threads(),
-            "open_files": len(process.open_files()),
-            "daemon_uptime_hours": (time.time() - self.start_time) / 3600 if self.start_time else 0
-        }
-
-    def get_run_logs(self, run_id: str, limit: int = 1000) -> RFPRunLogs:
+    def get_run_logs(self, run_id: str) -> List[Dict[str, Any]]:
         """Get logs for a specific run"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        try:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT timestamp, level, message, details
+                    FROM rfp_logs
+                    WHERE run_id = ?
+                    ORDER BY timestamp
+                """, (run_id,))
 
-        cursor.execute("""
-            SELECT timestamp, level, message, details
-            FROM rfp_logs
-            WHERE run_id = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (run_id, limit))
+                logs = []
+                for row in cursor.fetchall():
+                    log_entry = {
+                        "timestamp": row["timestamp"],
+                        "level": row["level"],
+                        "message": row["message"]
+                    }
+                    if row["details"]:
+                        log_entry["details"] = json.loads(row["details"])
+                    logs.append(log_entry)
 
-        entries = []
-        for row in cursor.fetchall():
-            entries.append(RFPLogEntry(
-                timestamp=datetime.fromisoformat(row[0]),
-                level=row[1],
-                message=row[2],
-                details=json.loads(row[3]) if row[3] else None
-            ))
+                return logs
 
-        conn.close()
+        except Exception as e:
+            logger.error(f"Error getting run logs: {e}")
+            return []
 
-        return RFPRunLogs(
-            run_id=run_id,
-            entries=entries,
-            total_entries=len(entries)
-        )
+    def _log_run_start(self, run_id: str, search_config: RFPSearchRequest):
+        """Log run start to database"""
+        try:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO rfp_runs
+                    (run_id, started_at, status, search_config)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    run_id,
+                    datetime.now().isoformat(),
+                    RunStatus.RUNNING.value,
+                    json.dumps(search_config.dict())
+                ))
+                conn.commit()
 
-    def _load_schedules(self):
-        """Load schedules from database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        except Exception as e:
+            logger.error(f"Error logging run start: {e}")
 
-        cursor.execute("""
-            SELECT schedule_id, name, cron_expression, enabled, search_config, last_run, next_run
-            FROM rfp_schedules
-            WHERE enabled = 1
-        """)
+    def _log_run_complete(self, run_id: str, result: RFPDiscoveryRun):
+        """Log run completion to database"""
+        try:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE rfp_runs SET
+                        completed_at = ?,
+                        status = ?,
+                        total_found = ?,
+                        total_processed = ?,
+                        total_qualified = ?,
+                        total_maybe = ?,
+                        total_rejected = ?,
+                        total_errors = ?,
+                        processing_time_seconds = ?
+                    WHERE run_id = ?
+                """, (
+                    datetime.now().isoformat(),
+                    RunStatus.COMPLETED.value,
+                    result.total_found,
+                    result.total_processed,
+                    result.total_qualified,
+                    result.total_maybe,
+                    result.total_rejected,
+                    result.total_errors,
+                    result.processing_time_seconds,
+                    run_id
+                ))
+                conn.commit()
 
-        for row in cursor.fetchall():
-            schedule = RFPSchedule(
-                schedule_id=row[0],
-                name=row[1],
-                cron_expression=row[2],
-                enabled=bool(row[3]),
-                search_config=RFPSearchRequest(**json.loads(row[4])),
-                last_run=datetime.fromisoformat(row[5]) if row[5] else None,
-                next_run=datetime.fromisoformat(row[6]) if row[6] else None
-            )
-            self.schedules[schedule.schedule_id] = schedule
+        except Exception as e:
+            logger.error(f"Error logging run completion: {e}")
 
-        conn.close()
-        logger.info(f"Loaded {len(self.schedules)} schedules from database")
+    def _log_run_error(self, run_id: str, error: str):
+        """Log run error to database"""
+        try:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE rfp_runs SET
+                        completed_at = ?,
+                        status = ?,
+                        errors = ?
+                    WHERE run_id = ?
+                """, (
+                    datetime.now().isoformat(),
+                    RunStatus.FAILED.value,
+                    json.dumps([{"error": error}]),
+                    run_id
+                ))
+                conn.commit()
 
-    def _save_run_to_db(self, run: RFPDiscoveryRun):
-        """Save run to database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO rfp_runs
-            (run_id, started_at, completed_at, status, total_found, total_processed,
-             total_qualified, total_maybe, total_rejected, total_errors,
-             processing_time_seconds, search_config, errors)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            run.run_id,
-            run.started_at.isoformat(),
-            run.completed_at.isoformat() if run.completed_at else None,
-            run.status.value,
-            run.total_found,
-            run.total_processed,
-            run.total_qualified,
-            run.total_maybe,
-            run.total_rejected,
-            run.total_errors,
-            run.processing_time_seconds,
-            json.dumps(run.search_config.dict()),
-            json.dumps(run.errors) if run.errors else None
-        ))
-
-        conn.commit()
-        conn.close()
-
-    def _update_schedule_in_db(self, schedule: RFPSchedule):
-        """Update schedule in database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            UPDATE rfp_schedules
-            SET last_run = ?, next_run = ?
-            WHERE schedule_id = ?
-        """, (
-            schedule.last_run.isoformat() if schedule.last_run else None,
-            schedule.next_run.isoformat() if schedule.next_run else None,
-            schedule.schedule_id
-        ))
-
-        conn.commit()
-        conn.close()
+        except Exception as e:
+            logger.error(f"Error logging run error: {e}")
 
     def _log_to_db(self, run_id: str, level: str, message: str, details: Optional[Dict] = None):
-        """Log to database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        """Log message to database"""
+        try:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO rfp_logs
+                    (run_id, timestamp, level, message, details)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    run_id,
+                    datetime.now().isoformat(),
+                    level,
+                    message,
+                    json.dumps(details) if details else None
+                ))
+                conn.commit()
 
-        cursor.execute("""
-            INSERT INTO rfp_logs (run_id, timestamp, level, message, details)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            run_id,
-            datetime.now().isoformat(),
-            level,
-            message,
-            json.dumps(details) if details else None
-        ))
+        except Exception as e:
+            logger.error(f"Error logging to database: {e}")
 
-        conn.commit()
-        conn.close()
-
-    def _cleanup_old_logs(self, days: int):
-        """Remove logs older than specified days"""
-        cutoff = datetime.now() - timedelta(days=days)
-
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            DELETE FROM rfp_logs
-            WHERE timestamp < ?
-        """, (cutoff.isoformat(),))
-
-        deleted = cursor.rowcount
-        if deleted > 0:
-            logger.debug(f"Cleaned up {deleted} old log entries")
-
-        conn.commit()
-        conn.close()
-
-    def _cleanup_old_runs(self, days: int):
-        """Remove runs older than specified days"""
-        cutoff = datetime.now() - timedelta(days=days)
-
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # Delete old runs and their logs
-        cursor.execute("""
-            DELETE FROM rfp_runs
-            WHERE started_at < ?
-        """, (cutoff.isoformat(),))
-
-        deleted = cursor.rowcount
-        if deleted > 0:
-            logger.debug(f"Cleaned up {deleted} old runs")
-
-        conn.commit()
-        conn.close()
+    def _get_memory_usage(self) -> float:
+        """Get current memory usage in MB"""
+        try:
+            import psutil
+            import os
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / 1024 / 1024
+        except:
+            return 0
 
 
-# Global daemon instance
-daemon_instance: Optional[RFPDaemon] = None
-
+# Singleton instance
+_daemon_instance: Optional[RFPDaemon] = None
 
 def get_daemon() -> RFPDaemon:
     """Get or create daemon instance"""
-    global daemon_instance
-    if not daemon_instance:
-        daemon_instance = RFPDaemon()
-    return daemon_instance
+    global _daemon_instance
+    if _daemon_instance is None:
+        _daemon_instance = RFPDaemon()
+    return _daemon_instance

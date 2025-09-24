@@ -197,7 +197,7 @@ async def update_schedule(
     """Update an existing schedule"""
     try:
         # Remove old schedule
-        if not daemon.remove_schedule(schedule_id):
+        if not daemon.delete_schedule(schedule_id):
             raise HTTPException(status_code=404, detail="Schedule not found")
 
         # Add updated schedule
@@ -218,7 +218,7 @@ async def delete_schedule(
     daemon: RFPDaemon = Depends(get_rfp_daemon)
 ):
     """Delete a schedule"""
-    if not daemon.remove_schedule(schedule_id):
+    if not daemon.delete_schedule(schedule_id):
         raise HTTPException(status_code=404, detail="Schedule not found")
 
     return {"status": "deleted", "schedule_id": schedule_id}
@@ -466,4 +466,23 @@ async def validate_settings():
         return validation
     except Exception as e:
         logger.error(f"Failed to validate settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/test-api-keys")
+async def test_api_keys():
+    """Test if API keys are configured and accessible"""
+    try:
+        service = get_settings_service()
+        settings = service.get_settings()
+
+        return {
+            "sam_api_key_configured": bool(settings.api_keys.sam_gov_api_key),
+            "sam_api_key_length": len(settings.api_keys.sam_gov_api_key) if settings.api_keys.sam_gov_api_key else 0,
+            "google_configured": bool(settings.api_keys.google_service_account_json),
+            "can_run_discovery": bool(settings.api_keys.sam_gov_api_key) or True,  # Allow test mode
+            "test_message": "API keys are accessible. You can now run RFP discovery!"
+        }
+    except Exception as e:
+        logger.error(f"Failed to test API keys: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -7,13 +7,16 @@ import json
 import logging
 import re
 import time
+import httpx
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlencode
 
 from app.services.base_service import BaseService
 from app.services.kamiwaza_service import KamiwazaService
 from app.services.settings_service import get_settings_service
+from app.services.sheets_service import SheetsService
 from app.models.rfp import (
     RFPOpportunity,
     RFPAssessment,
@@ -21,7 +24,8 @@ from app.models.rfp import (
     QualificationLevel,
     RFPDiscoveryRun,
     RunStatus,
-    RFPSearchRequest
+    RFPSearchRequest,
+    RFP
 )
 from app.core.errors import ServiceError, AIServiceError
 
@@ -36,6 +40,8 @@ class RFPDiscoveryService(BaseService):
         self.settings_service = get_settings_service()
         self.company_profile = self._load_company_profile()
         self.past_rfps = self._load_past_rfps()
+        self.sheets_service = None
+        self._initialize_sheets_service()
 
     async def process(self, request: Any) -> Any:
         """Required abstract method from BaseService"""
@@ -70,6 +76,19 @@ SAM UEI: {profile.sam_uei or 'Not specified'}
         if past_performance:
             return '\n'.join(past_performance)
         return "No past performance data configured"
+
+    def _initialize_sheets_service(self):
+        """Initialize Google Sheets service if configured"""
+        try:
+            settings = self.settings_service.get_settings()
+            self.sheets_service = SheetsService(settings)
+            if self.sheets_service.is_configured():
+                logger.info("Google Sheets service initialized")
+            else:
+                logger.info("Google Sheets not configured - will skip sheet updates")
+        except Exception as e:
+            logger.warning(f"Could not initialize Google Sheets service: {e}")
+            self.sheets_service = None
 
     async def discover_rfps(self, request: RFPSearchRequest) -> RFPDiscoveryRun:
         """
@@ -115,6 +134,14 @@ SAM UEI: {profile.sam_uei or 'Not specified'}
                     run.total_rejected += 1
 
             run.total_processed = len(processed_rfps)
+
+            # Push to Google Sheets if configured
+            if self.sheets_service and self.sheets_service.is_configured():
+                logger.info("Pushing RFPs to Google Sheets...")
+                rfps_for_sheets = self._convert_to_rfp_models(processed_rfps)
+                sheet_results = self.sheets_service.push_qualified_rfps(rfps_for_sheets)
+                logger.info(f"Google Sheets update: {sheet_results}")
+
             run.status = RunStatus.COMPLETED
             run.completed_at = datetime.now()
             run.processing_time_seconds = (
@@ -145,9 +172,79 @@ SAM UEI: {profile.sam_uei or 'Not specified'}
         sam_api_key = self.settings_service.get_sam_api_key()
 
         if sam_api_key:
-            # TODO: Implement real SAM.gov API integration
-            logger.info("SAM.gov API key configured - would use real API")
-            # For now, still return mock data
+            logger.info("Using SAM.gov API with real data")
+            try:
+                # Build search query
+                query_parts = []
+                for keyword in request.search_keywords:
+                    query_parts.append(keyword)
+                search_query = " OR ".join(query_parts)
+
+                # Calculate date range
+                posted_from = (datetime.now() - timedelta(days=request.days_back)).strftime('%Y-%m-%d')
+                posted_to = datetime.now().strftime('%Y-%m-%d')
+
+                # Build API parameters
+                params = {
+                    'api_key': sam_api_key,
+                    'q': search_query,
+                    'postedFrom': posted_from,
+                    'postedTo': posted_to,
+                    'limit': min(request.max_rfps, 100),  # SAM.gov limits to 100 per request
+                    'offset': 0,
+                    'ptype': 'o',  # Opportunities only
+                    'active': 'true'  # Active opportunities only
+                }
+
+                # Add NAICS codes if specified
+                if request.include_naics:
+                    params['ncode'] = ','.join(request.include_naics)
+
+                # Make API request
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.get(
+                        'https://api.sam.gov/opportunities/v2/search',
+                        params=params,
+                        headers={
+                            'Accept': 'application/json',
+                            'User-Agent': 'RFP-Discovery-System/1.0'
+                        }
+                    )
+
+                    if response.status_code == 200:
+                        data = response.json()
+                        opportunities = data.get('opportunitiesData', [])
+
+                        # Transform SAM.gov format to our internal format
+                        formatted_opportunities = []
+                        for opp in opportunities:
+                            formatted_opp = {
+                                'noticeId': opp.get('noticeId', ''),
+                                'solicitationNumber': opp.get('solicitationNumber', ''),
+                                'title': opp.get('title', ''),
+                                'fullParentPathName': opp.get('fullParentPathName', ''),
+                                'description': opp.get('description', ''),
+                                'postedDate': opp.get('postedDate', ''),
+                                'responseDeadLine': opp.get('responseDeadLine', ''),
+                                'naicsCode': opp.get('naicsCode', ''),
+                                'typeOfSetAsideDescription': opp.get('typeOfSetAsideDescription', ''),
+                                'placeOfPerformanceCity': opp.get('placeOfPerformanceCity', {}).get('city', '') if isinstance(opp.get('placeOfPerformanceCity'), dict) else opp.get('placeOfPerformanceCity', ''),
+                                'uiLink': opp.get('uiLink', '')
+                            }
+                            formatted_opportunities.append(formatted_opp)
+
+                        logger.info(f"Retrieved {len(formatted_opportunities)} opportunities from SAM.gov API")
+
+                        # If we got opportunities, use them; otherwise fall back to mock data
+                        if formatted_opportunities:
+                            return self._filter_opportunities(formatted_opportunities, request)
+                    else:
+                        logger.error(f"SAM.gov API returned status code {response.status_code}: {response.text}")
+                        logger.info("Falling back to mock data")
+
+            except Exception as e:
+                logger.error(f"Error calling SAM.gov API: {e}")
+                logger.info("Falling back to mock data due to API error")
         else:
             logger.info("No SAM.gov API key configured - using mock data for demonstration")
 
@@ -202,13 +299,16 @@ SAM UEI: {profile.sam_uei or 'Not specified'}
                     filtered_opportunities.append(opp)
                     break
 
-        # Limit to max_rfps
-        all_opportunities = filtered_opportunities[:request.max_rfps]
-        logger.info(f"Returning {len(all_opportunities)} mock opportunities for testing")
+        return self._filter_opportunities(filtered_opportunities, request)
+
+    def _filter_opportunities(self, opportunities: List[Dict[str, Any]], request: RFPSearchRequest) -> List[Dict[str, Any]]:
+        """Filter and deduplicate opportunities based on request criteria"""
+        # Limit to max_rfps first
+        opportunities = opportunities[:request.max_rfps]
 
         # Deduplicate by notice ID
         unique = {}
-        for opp in all_opportunities:
+        for opp in opportunities:
             notice_id = opp.get('noticeId')
             if notice_id and notice_id not in unique:
                 # Filter out excluded keywords
@@ -224,10 +324,10 @@ SAM UEI: {profile.sam_uei or 'Not specified'}
                 if not should_exclude:
                     unique[notice_id] = opp
 
-        opportunities = list(unique.values())[:request.max_rfps]
-        logger.info(f"Found {len(opportunities)} unique opportunities after filtering")
+        filtered_opportunities = list(unique.values())[:request.max_rfps]
+        logger.info(f"Found {len(filtered_opportunities)} unique opportunities after filtering")
 
-        return opportunities
+        return filtered_opportunities
 
     async def _process_opportunities_batch(
         self,
@@ -554,3 +654,28 @@ Output ONLY valid JSON, no other text."""
             logger.debug(f"Could not parse date '{date_str}': {e}")
 
         return None
+    def _convert_to_rfp_models(self, processed_rfps: List[ProcessedRFP]) -> List[RFP]:
+        """Convert ProcessedRFP objects to RFP models for Google Sheets"""
+        rfp_models = []
+
+        for processed in processed_rfps:
+            rfp = RFP(
+                notice_id=processed.opportunity.notice_id,
+                title=processed.opportunity.title,
+                agency=processed.opportunity.agency,
+                posted_date=processed.opportunity.posted_date,
+                response_deadline=processed.opportunity.response_deadline,
+                naics_code=processed.opportunity.naics_code,
+                solicitation_number=processed.opportunity.solicitation_number,
+                url=processed.opportunity.url,
+                description=processed.opportunity.description,
+                ai_score=processed.assessment.relevance_score,
+                ai_justification=processed.assessment.justification,
+                key_requirements=processed.assessment.key_requirements,
+                suggested_approach=processed.assessment.suggested_approach,
+                qualification_level=processed.assessment.qualification_level.value,
+                discovered_at=datetime.now()
+            )
+            rfp_models.append(rfp)
+
+        return rfp_models

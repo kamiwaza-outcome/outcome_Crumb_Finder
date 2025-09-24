@@ -13,6 +13,8 @@ from enum import Enum
 
 class TimestampedModel(BaseModel):
     """Base model with automatic timestamp fields."""
+    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: Optional[datetime] = None
 
@@ -45,6 +47,8 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     """Standard error response format."""
+    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
+
     status: ResponseStatus = Field(default=ResponseStatus.ERROR)
     errors: List[ErrorDetail] = Field(..., description="List of errors")
     request_id: Optional[str] = Field(None, description="Request tracking ID")
@@ -84,6 +88,8 @@ class HealthStatus(BaseModel):
 
 class HealthResponse(BaseModel):
     """Complete health check response."""
+    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
+
     status: str = Field(..., description="Overall health status")
     service: str = Field(..., description="Service name")
     version: str = Field(..., description="Service version")

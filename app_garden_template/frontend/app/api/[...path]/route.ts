@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8001';
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 
 const EXCLUDED_HEADERS = new Set([
   'host', 'connection', 'content-length', 'transfer-encoding',

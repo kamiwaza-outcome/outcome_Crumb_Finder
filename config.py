@@ -7,6 +7,9 @@ class Config:
     # Load company configuration
     COMPANY_CONFIG_PATH = os.getenv('COMPANY_CONFIG_PATH', './company_config.json')
 
+    # Initialize company configuration
+    _company_config = None
+
     @classmethod
     def load_company_config(cls):
         """Load company configuration from JSON file"""
@@ -30,9 +33,6 @@ class Config:
                 'rfp_targeting': {'keywords': [], 'naics_codes': []}
             }
 
-    # Initialize company configuration
-    _company_config = None
-
     @classmethod
     def get_company_config(cls):
         """Get cached company configuration"""
@@ -40,7 +40,6 @@ class Config:
             cls._company_config = cls.load_company_config()
         return cls._company_config
 
-class Config:
     # API Keys (will be set via environment variables or direct assignment)
     SAM_API_KEY = os.getenv('SAM_API_KEY', '')
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')

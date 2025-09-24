@@ -149,11 +149,26 @@ export default function SettingsPage() {
     }
 
     try {
-      await api.post('/rfp/settings', settingsToSave)
+      const response = await fetch('/api/rfp/settings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(settingsToSave),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.text()
+        console.error('Response error:', errorData)
+        throw new Error(errorData || response.statusText)
+      }
+
+      const data = await response.json()
       setMessage({ type: 'success', text: 'Settings saved successfully!' })
       setTimeout(() => setMessage(null), 3000)
-    } catch (error) {
-      setMessage({ type: 'error', text: 'Failed to save settings' })
+    } catch (error: any) {
+      const errorMsg = error.message || 'Failed to save settings'
+      setMessage({ type: 'error', text: errorMsg })
       console.error('Failed to save settings:', error)
       setTimeout(() => setMessage(null), 5000)
     }
